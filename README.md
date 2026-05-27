@@ -1,43 +1,58 @@
 # Art Locker
 
-Experimental art-first lock screen for Linux/XFCE multi-monitor desktops.
+<p align="center">
+  <strong>An art-first lock screen for Linux/XFCE multi-monitor desktops.</strong>
+</p>
 
-Art Locker shows a museum-style artwork backdrop across all monitors, then
-reveals a macOS-inspired acrylic login prompt when the user wakes the session.
-It was built for an XFCE + X11 workstation with three monitors, including one
-portrait display.
+<p align="center">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20X11-blue">
+  <img alt="Desktop" src="https://img.shields.io/badge/desktop-XFCE-informational">
+  <img alt="Status" src="https://img.shields.io/badge/status-alpha-orange">
+</p>
 
-> Status: alpha. This is not ready to trust as your only lock screen.
+<p align="center">
+  <img alt="Art Locker login preview" src="docs/screenshots/login.jpg" width="860">
+</p>
 
-## Why This Exists
+Art Locker turns the idle lock screen into a quiet gallery moment: artwork
+across every monitor, a focused macOS-inspired acrylic login prompt, and strict
+startup checks so unreliable monitor states fail cleanly.
 
-Most Linux lockers are reliable but visually plain. Art Locker explores a
-lock screen that feels calm, high-contrast, and personal while keeping the
-desktop locked during idle. The current goal is to harden the locker so it can
-survive real-world monitor sleep/wake, DPMS transitions, and multi-monitor
-geometry changes.
+> [!WARNING]
+> Art Locker is alpha software. Test it with a recovery path available, such as
+> SSH, TTY access, or a physical console. Do not make it your only lock screen
+> until your fullscreen and sleep/wake flows are proven stable.
 
-## Current Features
+## Highlights
 
-- Fullscreen X11/Tk lock windows on every detected monitor.
-- Primary-monitor login prompt with avatar, user name, and password field.
-- Artwork-of-the-day integration with custom art directories or curator data.
-- Side-monitor artwork signatures.
-- Instance lock to prevent duplicate lockers.
-- Refuses to start if X11 or monitor geometry is not ready.
-- Refuses to continue if global keyboard/pointer grab fails.
-- Local diagnostic log at `~/.local/share/art-locker/locker.log`.
-- Killswitch file: `touch /tmp/art-locker-killswitch`.
+- Multi-monitor fullscreen lock windows for X11 desktops.
+- Centered login card with avatar, user name, and single password field.
+- Artwork from custom directories, static assets, or a curator script.
+- Startup guardrails for X11 readiness and monitor geometry.
+- Hard failure if global keyboard/pointer grab cannot be acquired.
+- Single-instance lockfile to avoid duplicate lockers.
+- Killswitch for emergency recovery.
+- Local diagnostic logging.
+- Disabled-by-default `xautolock` autostart example.
 
-## Known Risks
+## Screenshots
 
-- The project is alpha and should be tested with another recovery path
-  available, such as SSH, TTY access, or a physical console.
-- Tk/X11 fullscreen behavior can be sensitive to compositors and window
-  managers.
-- DPMS and monitor wake timing can report unstable geometry during transitions.
-- PAM behavior differs between distributions.
-- This has been tested primarily on XFCE/X11, not Wayland.
+| Gallery State | Login State |
+| --- | --- |
+| <img src="docs/screenshots/preview.jpg" alt="Art Locker gallery preview" width="420"> | <img src="docs/screenshots/login.jpg" alt="Art Locker login preview" width="420"> |
+
+## How It Works
+
+Art Locker starts by validating that X11 is reachable and that `xrandr`
+reports a sane monitor layout. It then creates one fullscreen Tk window per
+monitor. The primary monitor gets the quote, artwork metadata, and login card;
+side monitors get simplified artwork signatures.
+
+When the user interacts with the lock screen, the UI transitions from gallery
+mode to authentication mode. Password validation uses PAM through `pamela`
+without calling `pam_setcred`, avoiding a common user-space locker failure mode
+on some distributions.
 
 ## Requirements
 
@@ -47,49 +62,75 @@ geometry changes.
 - Pillow
 - pamela
 - `xdpyinfo`
-- `xautolock` if you want idle activation
+- `xautolock`, only if you want idle activation
 
-Install Python dependencies:
-
-```bash
-python3 -m pip install --user Pillow pamela
-```
-
-On Debian/Ubuntu-like systems, package names are commonly:
+Debian/Ubuntu-style packages:
 
 ```bash
 sudo apt install x11-xserver-utils x11-utils xautolock python3-pil python3-pamela
 ```
 
-## Quick Check
-
-Run the non-invasive validation first:
+Python packages:
 
 ```bash
+python3 -m pip install --user Pillow pamela
+```
+
+## Quick Start
+
+Clone and validate the environment:
+
+```bash
+git clone https://github.com/juliosuas/art-locker.git
+cd art-locker
 ./art-locker --check
 ```
 
-Expected output:
+Expected:
 
 ```text
 OK display ready; monitors=3; artwork=/path/to/artwork.jpg
 ```
 
-## Preview
-
-Preview mode opens a normal window and does not grab input or authenticate:
+Run the safe preview:
 
 ```bash
 ./art-locker --preview
 ```
 
-Press any key or move the pointer inside the preview to reveal the login card.
-Press `Return` or `Esc` to exit preview.
+Preview mode opens a normal window. It does not grab input and does not
+authenticate. Press any key or move the pointer inside the preview to reveal
+the login card.
 
-## Manual Fullscreen Test
+## Artwork Sources
 
-Before testing fullscreen, keep a recovery path available. In another terminal
-or over SSH, prepare the killswitch command:
+Art Locker can use artwork from several places:
+
+- `ART_LOCKER_ART_DIRS`: colon-separated list of local directories.
+- `ART_LOCKER_STATIC_DIR`: directory for static fallback artwork.
+- `ART_LOCKER_CURATOR`: optional script that returns JSON curator data.
+
+Example:
+
+```bash
+export ART_LOCKER_ART_DIRS="$HOME/Pictures/art:$HOME/Pictures/wallpapers"
+./art-locker --check
+```
+
+Supported local image extensions:
+
+- `.jpg`
+- `.jpeg`
+- `.png`
+- `.webp`
+
+The current code also keeps compatibility with an existing `monet-walls`
+curator if one is present locally, but Art Locker itself is not Monet-specific.
+
+## Fullscreen Test
+
+Before testing fullscreen, keep a recovery command ready from another terminal
+or SSH session:
 
 ```bash
 touch /tmp/art-locker-killswitch
@@ -101,53 +142,80 @@ Then run:
 ./art-locker
 ```
 
-If anything goes wrong, create the killswitch file from another terminal.
+If anything goes wrong, create the killswitch file. Art Locker polls for it and
+exits.
 
 ## Idle Activation
 
-Do not enable idle activation until fullscreen testing is clean.
-
-An example disabled autostart file is provided in:
+Idle activation is intentionally disabled by default. The example file lives at:
 
 ```text
 examples/art-idle.desktop
 ```
 
-To enable later, copy it to `~/.config/autostart/`, change:
+Install it locally while keeping it disabled:
+
+```bash
+./scripts/install-local-disabled.sh
+```
+
+Only after fullscreen testing is stable, edit the installed autostart file and
+change:
 
 ```ini
 Hidden=false
 X-GNOME-Autostart-enabled=true
 ```
 
-and make sure the `Exec=` path points to your installed `art-locker`.
+## Safety Model
 
-## Design Direction
+Art Locker tries to avoid the failure modes that make custom lock screens scary:
 
-The login prompt is intentionally closer to macOS than to a traditional Linux
-dialog:
+- It refuses to start if X11 is unavailable.
+- It samples monitor geometry more than once before using it.
+- It aborts if no usable monitor layout exists.
+- It aborts if global grab fails.
+- It writes a process lockfile to prevent duplicate lockers.
+- It exposes a killswitch file for recovery.
+- It logs to `~/.local/share/art-locker/locker.log`.
 
-- centered avatar
-- user display name
-- single password field
-- quiet acrylic treatment over the artwork
-- minimal status text
+These checks improve safety, but they are not a formal security guarantee.
 
-The lock screen should feel polished, but reliability comes first.
+## Known Risks
 
-## Community Help Wanted
+- Tk/X11 fullscreen behavior varies by compositor and window manager.
+- DPMS sleep/wake can temporarily report unstable monitor geometry.
+- PAM stacks differ across distributions.
+- Wayland is not supported yet.
+- Accessibility and keyboard-only flows need review.
 
-The main areas where help is needed:
+## Roadmap
 
-- robust DPMS sleep/wake handling
-- safer X11 grab behavior across window managers
-- cleaner PAM integration across distributions
-- screenshots and reports from different monitor layouts
-- accessibility review for contrast, keyboard flow, and font scaling
-- Wayland feasibility research
+- Harden DPMS sleep/wake behavior.
+- Add a dedicated config file.
+- Add deterministic artwork selection.
+- Add CI linting and packaging checks.
+- Improve accessibility and font fallback.
+- Explore Wayland-compatible architecture.
+- Package for Debian-style systems.
 
-Please include desktop environment, window manager, GPU, driver, monitor layout,
-and relevant logs when reporting bugs.
+## Contributing
+
+Bug reports are most useful when they include:
+
+- distro and version
+- desktop environment and window manager
+- X11 vs Wayland
+- GPU and driver
+- output of `xrandr --listmonitors`
+- relevant DPMS section from `xset q`
+- whether lock, blank, sleep, wake, and unlock worked
+- screenshot if geometry or UI is wrong
+- relevant `~/.local/share/art-locker/locker.log` lines
+
+The first tracking issue is:
+
+https://github.com/juliosuas/art-locker/issues/1
 
 ## License
 
