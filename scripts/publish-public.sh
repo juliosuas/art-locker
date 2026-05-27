@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_name="${1:-monet-locker}"
+repo_name="${1:-art-locker}"
 
 gh auth status >/dev/null
 
@@ -29,4 +29,4 @@ if ! gh issue list --repo "$(gh repo view --json nameWithOwner -q .nameWithOwner
     --body-file docs/initial-issue.md
 fi
 
-gh repo view --web
+gh repo view --json url -q .url

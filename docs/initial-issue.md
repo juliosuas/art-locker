@@ -1,6 +1,6 @@
 # Harden monitor sleep/wake and fullscreen lock reliability
 
-Monet Locker is currently alpha. We are looking for help making it reliable
+Art Locker is currently alpha. We are looking for help making it reliable
 across real-world XFCE/X11 multi-monitor setups.
 
 ## Context
@@ -36,8 +36,8 @@ The most fragile flow is idle lock plus monitor sleep/wake:
 - Repeated monitor detection before using geometry.
 - Abort if no usable monitor layout exists.
 - Abort if global grab fails.
-- Killswitch at `/tmp/monet-locker-v2-killswitch`.
-- Local log at `~/.local/share/monet-locker-v2/locker.log`.
+- Killswitch at `/tmp/art-locker-killswitch`.
+- Local log at `~/.local/share/art-locker/locker.log`.
 
 ## Help Wanted
 
@@ -51,7 +51,7 @@ Please test and report:
 - DPMS settings from `xset q`
 - whether lock, blank, sleep, wake, and unlock worked
 - screenshots if geometry or UI is wrong
-- relevant `~/.local/share/monet-locker-v2/locker.log` lines
+- relevant `~/.local/share/art-locker/locker.log` lines
 
 ## Acceptance Criteria
 

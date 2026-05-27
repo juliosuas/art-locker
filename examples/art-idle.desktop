@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Art idle locker v2
+Comment=Experimental Art lock screen for XFCE/X11
+Exec=xautolock -time 30 -locker art-locker -detectsleep -secure
+Hidden=true
+X-GNOME-Autostart-enabled=false
+OnlyShowIn=XFCE;
+Terminal=false
+NoDisplay=true

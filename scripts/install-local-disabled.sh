@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-install -Dm755 monet-locker "$HOME/.local/bin/monet-locker"
-install -Dm644 examples/monet-idle-v2.desktop "$HOME/.config/autostart/monet-idle-v2.desktop"
+install -Dm755 art-locker "$HOME/.local/bin/art-locker"
+install -Dm644 examples/art-idle.desktop "$HOME/.config/autostart/art-idle.desktop"
 
-echo "Installed monet-locker to $HOME/.local/bin/monet-locker"
-echo "Installed disabled autostart file to $HOME/.config/autostart/monet-idle-v2.desktop"
-echo "Run: monet-locker --check"
+echo "Installed art-locker to $HOME/.local/bin/art-locker"
+echo "Installed disabled autostart file to $HOME/.config/autostart/art-idle.desktop"
+echo "Run: art-locker --check"

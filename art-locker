@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-monet-locker — Experimental art-first lock screen for XFCE/X11.
+art-locker — Experimental art-first lock screen for XFCE/X11.
 
 Flow:
-  INITIAL   Painting-of-day + quote shown across 3 monitors (via curator.py).
+  INITIAL   Artwork-of-day + quote shown across 3 monitors (via curator.py).
             Museum-style layout; no effects, no chrome.
   UNLOCK    On first input event, a subtle "Wake up, Neo..." typewriter
             appears top-left of the main monitor. Login card fades in at
@@ -15,7 +15,7 @@ Modes:
   --preview     Windowed (1280x720), no grab, no PAM (exit on Return/Esc).
   default       Fullscreen multi-monitor, keyboard/pointer grab, PAM auth.
 
-Kill-switch: `touch /tmp/monet-locker-v2-killswitch` force-exits.
+Kill-switch: `touch /tmp/art-locker-killswitch` force-exits.
 """
 
 import argparse
@@ -33,12 +33,13 @@ from pathlib import Path
 
 from PIL import Image, ImageTk, ImageFilter
 
-CURATOR = Path.home() / "Projects/monet-walls/screensaver/curator.py"
-STATIC_LOCK_DIR = Path.home() / "Pictures/monet-lock"
-LOG_DIR = Path.home() / ".local/share/monet-locker-v2"
+CURATOR = Path(os.environ.get("ART_LOCKER_CURATOR", Path.home() / "Projects/monet-walls/screensaver/curator.py"))
+STATIC_LOCK_DIR = Path(os.environ.get("ART_LOCKER_STATIC_DIR", Path.home() / "Pictures/art-locker"))
+LEGACY_MONET_DIR = Path.home() / "Pictures/monet-lock"
+LOG_DIR = Path.home() / ".local/share/art-locker"
 LOG_FILE = LOG_DIR / "locker.log"
-KILLSWITCH = Path("/tmp/monet-locker-v2-killswitch")
-LOCKFILE = Path("/tmp/monet-locker-v2.lock")
+KILLSWITCH = Path("/tmp/art-locker-killswitch")
+LOCKFILE = Path("/tmp/art-locker.lock")
 
 # WhiteSur-Dark aligned palette --------------------------------------------
 SURFACE_BG = "#1c1c1e"
@@ -84,7 +85,7 @@ def acquire_instance_lock():
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        log("refusing start: another monet-locker-v2 instance is active")
+        log("refusing start: another art-locker instance is active")
         raise SystemExit(4)
     os.ftruncate(fd, 0)
     os.write(fd, str(os.getpid()).encode("ascii"))
@@ -166,13 +167,13 @@ def get_today():
     except Exception as e:
         return {
             "painting": {
-                "artist": "Claude Monet",
-                "title": "Impression, Sunrise",
-                "year": 1872,
-                "museum": "Musée Marmottan Monet, Paris",
-                "didactic": "The painting that gave Impressionism its name.",
+                "artist": "Unknown artist",
+                "title": "Untitled",
+                "year": "",
+                "museum": "",
+                "didactic": "Fallback artwork shown because no curator data was available.",
             },
-            "painting_path": str(STATIC_LOCK_DIR / "dp2-main.jpg"),
+            "painting_path": None,
             "quote": {
                 "author": "Marcus Aurelius",
                 "original": "Memento mori.",
@@ -193,18 +194,29 @@ def resolve_painting_path(path):
     candidates = []
     if path:
         candidates.append(Path(path))
-    candidates.extend(sorted((Path.home() / "Projects/monet-walls/wallpapers").glob("*.jpg")))
+    env_dirs = os.environ.get("ART_LOCKER_ART_DIRS", "")
+    for raw_dir in [d for d in env_dirs.split(":") if d]:
+        art_dir = Path(raw_dir).expanduser()
+        candidates.extend(sorted(art_dir.glob("*.jpg")))
+        candidates.extend(sorted(art_dir.glob("*.jpeg")))
+        candidates.extend(sorted(art_dir.glob("*.png")))
+        candidates.extend(sorted(art_dir.glob("*.webp")))
     candidates.extend(sorted(STATIC_LOCK_DIR.glob("*.jpg")))
+    candidates.extend(sorted(STATIC_LOCK_DIR.glob("*.jpeg")))
+    candidates.extend(sorted(STATIC_LOCK_DIR.glob("*.png")))
+    candidates.extend(sorted(STATIC_LOCK_DIR.glob("*.webp")))
+    candidates.extend(sorted(LEGACY_MONET_DIR.glob("*.jpg")))
+    candidates.extend(sorted((Path.home() / "Projects/monet-walls/wallpapers").glob("*.jpg")))
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
             return str(candidate)
-    log("no usable painting file found; using generated fallback")
+    log("no usable artwork file found; using generated fallback")
     return None
 
 
 # -- image helpers ----------------------------------------------------------
 def cover_crop(path, w, h):
-    """Open and cover-crop a painting to exact (w,h), un-dimmed."""
+    """Open and cover-crop artwork to exact (w,h), un-dimmed."""
     if not path:
         img = Image.new("RGB", (w, h), "#101014")
         return img
@@ -300,7 +312,7 @@ class Locker:
 
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title("monet-locker")
+        self.root.title("art-locker")
 
         if not preview:
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -317,7 +329,7 @@ class Locker:
     def _build_preview(self):
         w, h = 1280, 720
         win = tk.Toplevel(self.root)
-        win.title("monet-locker — preview")
+        win.title("art-locker — preview")
         win.geometry(f"{w}x{h}")
         win.configure(bg="#000000")
         self._build_main_canvas(win, w, h)
@@ -354,7 +366,7 @@ class Locker:
         canvas = tk.Canvas(win, width=w, height=h, bg="#000000",
                            highlightthickness=0, bd=0)
         canvas.pack(fill="both", expand=True)
-        # keep the original un-dimmed painting for later acrylic crops
+        # keep the original un-dimmed artwork for later acrylic crops
         self._main_painting_original = cover_crop(self.today["painting_path"], w, h)
         self._main_w, self._main_h = w, h
 
@@ -546,7 +558,7 @@ class Locker:
                            font=(FONT_SANS, meta_size), anchor="sw")
 
     def _draw_vertical_signature(self, canvas, w, h):
-        """Portrait side monitor — only a subtle painting signature, no quote."""
+        """Portrait side monitor: only a subtle artwork signature, no quote."""
         p = self.today["painting"]
         title_size = max(16, w // 30)
         meta_size = max(10, w // 56)
@@ -899,7 +911,7 @@ def main():
         today = get_today()
         today["painting_path"] = resolve_painting_path(today.get("painting_path"))
         monitors = detect_monitors()
-        print(f"OK display ready; monitors={len(monitors)}; painting={today['painting_path']}")
+        print(f"OK display ready; monitors={len(monitors)}; artwork={today['painting_path']}")
         return
 
     lock_fd = None

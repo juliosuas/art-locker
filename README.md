@@ -1,8 +1,8 @@
-# Monet Locker
+# Art Locker
 
 Experimental art-first lock screen for Linux/XFCE multi-monitor desktops.
 
-Monet Locker shows a museum-style painting backdrop across all monitors, then
+Art Locker shows a museum-style artwork backdrop across all monitors, then
 reveals a macOS-inspired acrylic login prompt when the user wakes the session.
 It was built for an XFCE + X11 workstation with three monitors, including one
 portrait display.
@@ -11,7 +11,7 @@ portrait display.
 
 ## Why This Exists
 
-Most Linux lockers are reliable but visually plain. Monet Locker explores a
+Most Linux lockers are reliable but visually plain. Art Locker explores a
 lock screen that feels calm, high-contrast, and personal while keeping the
 desktop locked during idle. The current goal is to harden the locker so it can
 survive real-world monitor sleep/wake, DPMS transitions, and multi-monitor
@@ -21,13 +21,13 @@ geometry changes.
 
 - Fullscreen X11/Tk lock windows on every detected monitor.
 - Primary-monitor login prompt with avatar, user name, and password field.
-- Painting-of-the-day integration with `monet-walls` curator data.
-- Side-monitor painting signatures.
+- Artwork-of-the-day integration with custom art directories or curator data.
+- Side-monitor artwork signatures.
 - Instance lock to prevent duplicate lockers.
 - Refuses to start if X11 or monitor geometry is not ready.
 - Refuses to continue if global keyboard/pointer grab fails.
-- Local diagnostic log at `~/.local/share/monet-locker-v2/locker.log`.
-- Killswitch file: `touch /tmp/monet-locker-v2-killswitch`.
+- Local diagnostic log at `~/.local/share/art-locker/locker.log`.
+- Killswitch file: `touch /tmp/art-locker-killswitch`.
 
 ## Known Risks
 
@@ -66,13 +66,13 @@ sudo apt install x11-xserver-utils x11-utils xautolock python3-pil python3-pamel
 Run the non-invasive validation first:
 
 ```bash
-./monet-locker --check
+./art-locker --check
 ```
 
 Expected output:
 
 ```text
-OK display ready; monitors=3; painting=/path/to/painting.jpg
+OK display ready; monitors=3; artwork=/path/to/artwork.jpg
 ```
 
 ## Preview
@@ -80,7 +80,7 @@ OK display ready; monitors=3; painting=/path/to/painting.jpg
 Preview mode opens a normal window and does not grab input or authenticate:
 
 ```bash
-./monet-locker --preview
+./art-locker --preview
 ```
 
 Press any key or move the pointer inside the preview to reveal the login card.
@@ -92,13 +92,13 @@ Before testing fullscreen, keep a recovery path available. In another terminal
 or over SSH, prepare the killswitch command:
 
 ```bash
-touch /tmp/monet-locker-v2-killswitch
+touch /tmp/art-locker-killswitch
 ```
 
 Then run:
 
 ```bash
-./monet-locker
+./art-locker
 ```
 
 If anything goes wrong, create the killswitch file from another terminal.
@@ -110,7 +110,7 @@ Do not enable idle activation until fullscreen testing is clean.
 An example disabled autostart file is provided in:
 
 ```text
-examples/monet-idle-v2.desktop
+examples/art-idle.desktop
 ```
 
 To enable later, copy it to `~/.config/autostart/`, change:
@@ -120,7 +120,7 @@ Hidden=false
 X-GNOME-Autostart-enabled=true
 ```
 
-and make sure the `Exec=` path points to your installed `monet-locker`.
+and make sure the `Exec=` path points to your installed `art-locker`.
 
 ## Design Direction
 
