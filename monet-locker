@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+"""
+monet-locker — Experimental art-first lock screen for XFCE/X11.
+
+Flow:
+  INITIAL   Painting-of-day + quote shown across 3 monitors (via curator.py).
+            Museum-style layout; no effects, no chrome.
+  UNLOCK    On first input event, a subtle "Wake up, Neo..." typewriter
+            appears top-left of the main monitor. Login card fades in at
+            center-bottom with WhiteSur-Dark aesthetic. ~2.5s total.
+  AUTH      PAM auth via pamela. Success → destroy + exit 0. Fail → shake +
+            "Incorrect password", retry.
+
+Modes:
+  --preview     Windowed (1280x720), no grab, no PAM (exit on Return/Esc).
+  default       Fullscreen multi-monitor, keyboard/pointer grab, PAM auth.
+
+Kill-switch: `touch /tmp/monet-locker-v2-killswitch` force-exits.
+"""
+
+import argparse
+import fcntl
+import os
+import pwd
+import re
+import signal
+import subprocess
+import sys
+import time
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+
+from PIL import Image, ImageTk, ImageFilter
+
+CURATOR = Path.home() / "Projects/monet-walls/screensaver/curator.py"
+STATIC_LOCK_DIR = Path.home() / "Pictures/monet-lock"
+LOG_DIR = Path.home() / ".local/share/monet-locker-v2"
+LOG_FILE = LOG_DIR / "locker.log"
+KILLSWITCH = Path("/tmp/monet-locker-v2-killswitch")
+LOCKFILE = Path("/tmp/monet-locker-v2.lock")
+
+# WhiteSur-Dark aligned palette --------------------------------------------
+SURFACE_BG = "#1c1c1e"
+WINDOW_BG = "#2c2c2e"
+DIVIDER = "#3a3a3c"
+TEXT_PRIMARY = "#e5e5e7"
+TEXT_SECONDARY = "#98989d"
+TEXT_TERTIARY = "#636366"
+ACCENT = "#0a84ff"
+DESTRUCTIVE = "#ff453a"
+OVERLAY_DIM_RGBA = (0, 0, 0, 140)  # ~55%
+
+FONT_SERIF = "Noto Serif"
+FONT_SANS = "Inter"
+FONT_MONO = "Fira Code"
+
+# Metasploit wake-up-neo.txt, color codes stripped -------------------------
+NEO_LINES = [
+    "Call trans opt: received. 2-19-98 13:24:18 REC:Loc",
+    "",
+    "     Trace program: running",
+    "",
+    "           wake up, Neo...",
+    "        the matrix has you",
+    "      follow the white rabbit.",
+    "",
+    "          knock, knock, Neo.",
+]
+NEO_TEXT = "\n".join(NEO_LINES)
+
+
+def log(msg):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().isoformat(timespec="seconds")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{stamp} {msg}\n")
+
+
+def acquire_instance_lock():
+    LOCKFILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(LOCKFILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        log("refusing start: another monet-locker-v2 instance is active")
+        raise SystemExit(4)
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode("ascii"))
+    return fd
+
+
+def ensure_display_ready():
+    try:
+        subprocess.check_call(
+            ["timeout", "3", "xdpyinfo"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        log("refusing start: X display is not ready")
+        raise SystemExit(5)
+
+
+# -- monitor detection ------------------------------------------------------
+def _detect_monitors_once():
+    try:
+        out = subprocess.check_output(["xrandr", "--listmonitors"], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+    mons = []
+    for line in out.splitlines()[1:]:
+        m = re.match(r"\s*\d+:\s*(\+?\*?)(\S+)\s+(\d+)/\d+x(\d+)/\d+([+-]\d+)([+-]\d+)", line)
+        if not m:
+            continue
+        flags, name, w, h, x, y = m.groups()
+        mons.append({
+            "name": name,
+            "x": int(x), "y": int(y),
+            "w": int(w), "h": int(h),
+            "primary": "*" in flags,
+        })
+    return mons
+
+
+def _monitor_signature(monitors):
+    return tuple((m["name"], m["x"], m["y"], m["w"], m["h"], m["primary"]) for m in monitors)
+
+
+def detect_monitors():
+    previous = None
+    for _ in range(3):
+        mons = _detect_monitors_once()
+        if mons and previous == _monitor_signature(mons):
+            break
+        previous = _monitor_signature(mons)
+        time.sleep(0.25)
+    else:
+        mons = _detect_monitors_once()
+
+    if not mons:
+        log("refusing start: no monitors reported by xrandr")
+        raise SystemExit(6)
+    if not any(m["primary"] for m in mons):
+        mons[0]["primary"] = True
+    total_area = sum(m["w"] * m["h"] for m in mons)
+    if total_area < 800 * 600:
+        log(f"refusing start: invalid monitor area {total_area}")
+        raise SystemExit(7)
+    log("monitors " + ",".join(f"{m['name']}={m['w']}x{m['h']}+{m['x']}+{m['y']}" for m in mons))
+    return mons
+
+
+# -- curator bridge ---------------------------------------------------------
+def get_today():
+    try:
+        out = subprocess.check_output(
+            ["python3", str(CURATOR)],
+            stderr=subprocess.STDOUT,
+            timeout=15,
+        )
+        import json
+        return json.loads(out)
+    except Exception as e:
+        return {
+            "painting": {
+                "artist": "Claude Monet",
+                "title": "Impression, Sunrise",
+                "year": 1872,
+                "museum": "Musée Marmottan Monet, Paris",
+                "didactic": "The painting that gave Impressionism its name.",
+            },
+            "painting_path": str(STATIC_LOCK_DIR / "dp2-main.jpg"),
+            "quote": {
+                "author": "Marcus Aurelius",
+                "original": "Memento mori.",
+                "translation": "Remember you will die.",
+                "show_original": True,
+                "lang_original": "la",
+                "context": "Stoic discipline.",
+            },
+            "weather": {"desc": "unknown", "temp_c": None, "bucket": None},
+            "time_bucket": "night",
+            "date": "",
+            "_fallback": True,
+            "_error": str(e),
+        }
+
+
+def resolve_painting_path(path):
+    candidates = []
+    if path:
+        candidates.append(Path(path))
+    candidates.extend(sorted((Path.home() / "Projects/monet-walls/wallpapers").glob("*.jpg")))
+    candidates.extend(sorted(STATIC_LOCK_DIR.glob("*.jpg")))
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    log("no usable painting file found; using generated fallback")
+    return None
+
+
+# -- image helpers ----------------------------------------------------------
+def cover_crop(path, w, h):
+    """Open and cover-crop a painting to exact (w,h), un-dimmed."""
+    if not path:
+        img = Image.new("RGB", (w, h), "#101014")
+        return img
+    try:
+        img = Image.open(path).convert("RGB")
+    except Exception as e:
+        log(f"cover_crop failed for {path}: {e.__class__.__name__}")
+        return Image.new("RGB", (w, h), "#101014")
+    iw, ih = img.size
+    scale = max(w / iw, h / ih)
+    nw, nh = int(iw * scale), int(ih * scale)
+    img = img.resize((nw, nh), Image.LANCZOS)
+    left = (nw - w) // 2
+    top = (nh - h) // 2
+    return img.crop((left, top, left + w, top + h))
+
+
+def prepare_painting_for_monitor(path, w, h, dim=True):
+    img = cover_crop(path, w, h)
+    if dim:
+        overlay = Image.new("RGBA", (w, h), OVERLAY_DIM_RGBA)
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    return img
+
+
+def acrylic_crop(base_pil, region, blur_radius=30, darken_alpha=120):
+    """Extract a region from base_pil, blur, darken — yields a tk-ready PhotoImage."""
+    x0, y0, x1, y1 = region
+    sub = base_pil.crop((x0, y0, x1, y1))
+    if blur_radius:
+        sub = sub.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    if darken_alpha:
+        overlay = Image.new("RGBA", sub.size, (0, 0, 0, darken_alpha))
+        sub = Image.alpha_composite(sub.convert("RGBA"), overlay).convert("RGB")
+    return sub
+
+
+def pil_to_tk(img):
+    return ImageTk.PhotoImage(img)
+
+
+def get_display_name():
+    """Return the real user name (GECOS) or fall back to login."""
+    user = os.environ.get("USER") or os.getlogin()
+    try:
+        gecos = pwd.getpwnam(user).pw_gecos.split(",")[0]
+        return gecos or user
+    except KeyError:
+        return user
+
+
+# -- quote display logic ----------------------------------------------------
+def should_show_original(quote):
+    """Return True if quote.original is worth teaching alongside translation."""
+    flag = quote.get("show_original")
+    if flag is True:
+        return True
+    if flag is False:
+        return False
+    # fallback heuristic: short classical aphorism
+    orig = quote.get("original", "") or ""
+    lang = quote.get("lang_original", "en")
+    return len(orig) <= 45 and lang in ("la", "grc", "zh", "ja")
+
+
+# -- the locker app ---------------------------------------------------------
+class Locker:
+    def __init__(self, preview=False):
+        self.preview = preview
+        self.today = get_today()
+        self.today["painting_path"] = resolve_painting_path(self.today.get("painting_path"))
+        self.state = "INITIAL"
+        self.windows = []
+        self._main_window = None
+
+        self._neo_idx = 0
+        self._neo_line_text = ""
+        self._neo_current_line_y = 0
+        self._neo_line_h = 0
+        self._neo_font = None
+        self._neo_x = 0
+        self._neo_y = 0
+        self._neo_canvas = None
+        self._neo_current_line_id = None
+        self._neo_line_ids = []
+
+        self.auth_entry = None
+        self.auth_card = None           # (canvas, rect_id, name_id, entry_widget, status_id, x, y, w, h)
+        self.museum_card_ids = []       # to fade on AUTH
+
+        self.failed_attempts = 0
+        self._killswitch_timer = None
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.title("monet-locker")
+
+        if not preview:
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sig, lambda *_a: self._exit(128))
+
+        if preview:
+            self._build_preview()
+        else:
+            self._build_fullscreen()
+
+        self._start_killswitch_poll()
+
+    # -- window construction ------------------------------------------------
+    def _build_preview(self):
+        w, h = 1280, 720
+        win = tk.Toplevel(self.root)
+        win.title("monet-locker — preview")
+        win.geometry(f"{w}x{h}")
+        win.configure(bg="#000000")
+        self._build_main_canvas(win, w, h)
+        self._main_window = win
+        win.bind("<Escape>", lambda e: self._exit(0))
+        win.focus_force()
+
+    def _build_fullscreen(self):
+        ensure_display_ready()
+        monitors = detect_monitors()
+        main_mon = next((m for m in monitors if m["primary"]), monitors[0])
+        for mon in monitors:
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.geometry(f"{mon['w']}x{mon['h']}+{mon['x']}+{mon['y']}")
+            win.configure(bg="#000000")
+            win.attributes("-topmost", True)
+            if mon is main_mon:
+                self._build_main_canvas(win, mon["w"], mon["h"])
+                self._main_window = win
+            else:
+                self._build_side_canvas(win, mon["w"], mon["h"], mon["name"])
+        self._main_window.focus_force()
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+            self._main_window.grab_set_global()
+            log("global grab acquired")
+        except tk.TclError as e:
+            log(f"refusing lock: global grab failed: {e}")
+            self._exit(8)
+
+    def _build_main_canvas(self, win, w, h):
+        canvas = tk.Canvas(win, width=w, height=h, bg="#000000",
+                           highlightthickness=0, bd=0)
+        canvas.pack(fill="both", expand=True)
+        # keep the original un-dimmed painting for later acrylic crops
+        self._main_painting_original = cover_crop(self.today["painting_path"], w, h)
+        self._main_w, self._main_h = w, h
+
+        img = prepare_painting_for_monitor(self.today["painting_path"], w, h, dim=True)
+        photo = pil_to_tk(img)
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas.image_ref = photo
+
+        self._draw_header(canvas, w, h)
+        self._draw_quote(canvas, w, h)
+        self._draw_museum_card(canvas, w, h)
+
+        self.windows.append({"win": win, "canvas": canvas, "w": w, "h": h, "role": "main"})
+
+        win.bind("<Any-KeyPress>", self._on_input_event)
+        win.bind("<Motion>", self._on_input_event)
+        win.bind("<Button>", self._on_input_event)
+
+    def _build_side_canvas(self, win, w, h, monitor_name):
+        canvas = tk.Canvas(win, width=w, height=h, bg="#000000",
+                           highlightthickness=0, bd=0)
+        canvas.pack(fill="both", expand=True)
+
+        companion_map = {
+            "HDMI-0": STATIC_LOCK_DIR / "hdmi0-left.jpg",
+            "DP-4": STATIC_LOCK_DIR / "dp4-right.jpg",
+        }
+        companion = companion_map.get(monitor_name)
+        path = str(companion) if companion and companion.exists() else self.today["painting_path"]
+        img = prepare_painting_for_monitor(path, w, h, dim=True)
+        photo = pil_to_tk(img)
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas.image_ref = photo
+
+        if h > w:
+            self._draw_vertical_signature(canvas, w, h)
+        else:
+            self._draw_side_signature(canvas, w, h)
+
+        win.bind("<Any-KeyPress>", self._on_input_event)
+        win.bind("<Motion>", self._on_input_event)
+        win.bind("<Button>", self._on_input_event)
+        self.windows.append({"win": win, "canvas": canvas, "w": w, "h": h, "role": "side", "name": monitor_name})
+
+    # -- header -------------------------------------------------------------
+    def _draw_header(self, canvas, w, h):
+        header = " ".join(x for x in [
+            self.today.get("date", ""),
+            self.today.get("weather", {}).get("desc", ""),
+            self.today.get("time_bucket", ""),
+        ] if x)
+        size = max(10, h // 110)
+        canvas.create_text(w - 28, 24, text=header, fill=TEXT_TERTIARY,
+                           font=(FONT_MONO, size), anchor="ne")
+
+    # -- quote central ------------------------------------------------------
+    def _draw_quote(self, canvas, w, h):
+        q = self.today["quote"]
+        orig = q.get("original", "") or ""
+        transl = q.get("translation")
+        lang = q.get("lang_original", "en")
+        author = q.get("author", "")
+
+        center_x = w / 2
+        top_region_y = int(h * 0.20)
+
+        body_size = max(24, h // 36)
+        sub_size = max(14, h // 64)
+        author_size = max(12, h // 72)
+        wrap_chars = max(44, w // 28)
+
+        show_orig = should_show_original(q)
+        # quote-in-english case: lang == "en" and translation is None
+        english_only = (lang == "en" and transl is None)
+
+        y = top_region_y
+        line_gap = int(body_size * 1.30)
+
+        if english_only:
+            # treat `original` as the body (already English)
+            body_lines = self._wrap_text(orig, wrap_chars)
+            for ln in body_lines:
+                canvas.create_text(center_x, y, text=ln, fill=TEXT_PRIMARY,
+                                   font=(FONT_SERIF, body_size, "italic"),
+                                   anchor="center")
+                y += line_gap
+        elif show_orig:
+            # original as hero, translation below subdued
+            orig_lines = self._wrap_text(orig, wrap_chars)
+            for ln in orig_lines:
+                canvas.create_text(center_x, y, text=ln, fill=TEXT_PRIMARY,
+                                   font=(FONT_SERIF, body_size, "italic"),
+                                   anchor="center")
+                y += line_gap
+            if transl:
+                y += int(sub_size * 0.3)
+                trans_lines = self._wrap_text(transl, wrap_chars + 8)
+                for ln in trans_lines:
+                    canvas.create_text(center_x, y, text=ln, fill=TEXT_SECONDARY,
+                                       font=(FONT_SANS, sub_size),
+                                       anchor="center")
+                    y += int(sub_size * 1.35)
+        else:
+            # translation only, as body
+            body_text = transl or orig
+            body_lines = self._wrap_text(body_text, wrap_chars)
+            for ln in body_lines:
+                canvas.create_text(center_x, y, text=ln, fill=TEXT_PRIMARY,
+                                   font=(FONT_SERIF, body_size, "italic"),
+                                   anchor="center")
+                y += line_gap
+
+        # thin divider + author
+        y += int(author_size * 1.0)
+        div_w = int(w * 0.04)
+        canvas.create_line(center_x - div_w, y, center_x + div_w, y,
+                           fill=DIVIDER, width=1)
+        y += int(author_size * 1.6)
+        canvas.create_text(center_x, y, text=author, fill=TEXT_SECONDARY,
+                           font=(FONT_SANS, author_size), anchor="center")
+
+    # -- museum card (bottom, subtle, boosted text contrast) ---------------
+    def _draw_museum_card(self, canvas, w, h):
+        p = self.today["painting"]
+        title = p.get("title", "")
+        artist = p.get("artist", "")
+        year = p.get("year", "")
+        museum = p.get("museum", "")
+        didactic = p.get("didactic", "") or ""
+
+        center_x = w / 2
+        bottom_y = int(h * 0.92)
+
+        title_size = max(18, h // 54)
+        meta_size = max(11, h // 92)
+        did_size = max(12, h // 76)
+        wrap_did = max(70, w // 22)
+
+        rule_y = bottom_y - int(h * 0.16)
+        rule_w = int(w * 0.22)
+        rid = canvas.create_line(center_x - rule_w, rule_y,
+                                 center_x + rule_w, rule_y,
+                                 fill=DIVIDER, width=1)
+        self.museum_card_ids.append(rid)
+
+        y = rule_y + int(title_size * 1.2)
+        tid = canvas.create_text(center_x, y,
+                                 text=f"{artist} — {title}",
+                                 fill="#f5f5f7",
+                                 font=(FONT_SERIF, title_size),
+                                 anchor="center")
+        self.museum_card_ids.append(tid)
+
+        y += int(meta_size * 2.6)
+        meta_parts = []
+        if year:
+            meta_parts.append(str(year))
+        if museum:
+            meta_parts.append(museum.upper())
+        meta = "   ·   ".join(meta_parts)
+        mid = canvas.create_text(center_x, y, text=meta,
+                                 fill="#c8c8cc",
+                                 font=(FONT_SANS, meta_size),
+                                 anchor="center")
+        self.museum_card_ids.append(mid)
+
+        lines = self._wrap_text(didactic, wrap_did)[:2]
+        y += int(did_size * 1.8)
+        for ln in lines:
+            did_id = canvas.create_text(center_x, y, text=ln,
+                                        fill="#e4e4e8",
+                                        font=(FONT_SERIF, did_size, "italic"),
+                                        anchor="center")
+            self.museum_card_ids.append(did_id)
+            y += int(did_size * 1.45)
+
+    # -- side monitors ------------------------------------------------------
+    def _draw_side_signature(self, canvas, w, h):
+        p = self.today["painting"]
+        title_size = max(18, h // 36)
+        meta_size = max(11, h // 72)
+        canvas.create_text(60, h - 80, text=p.get("title", ""),
+                           fill=TEXT_PRIMARY,
+                           font=(FONT_SERIF, title_size),
+                           anchor="sw")
+        meta = f"{p.get('artist','')}   ·   {p.get('year','')}"
+        canvas.create_text(60, h - 44, text=meta,
+                           fill=TEXT_TERTIARY,
+                           font=(FONT_SANS, meta_size), anchor="sw")
+
+    def _draw_vertical_signature(self, canvas, w, h):
+        """Portrait side monitor — only a subtle painting signature, no quote."""
+        p = self.today["painting"]
+        title_size = max(16, w // 30)
+        meta_size = max(10, w // 56)
+        canvas.create_text(w / 2, h - 90, text=p.get("title", ""),
+                           fill=TEXT_PRIMARY,
+                           font=(FONT_SERIF, title_size),
+                           anchor="center")
+        canvas.create_text(w / 2, h - 52,
+                           text=f"{p.get('artist','')}  ·  {p.get('year','')}",
+                           fill=TEXT_TERTIARY,
+                           font=(FONT_SANS, meta_size), anchor="center")
+
+    # -- wrap helper --------------------------------------------------------
+    @staticmethod
+    def _wrap_text(text, max_chars):
+        if not text:
+            return [""]
+        words = text.split()
+        lines, cur = [], ""
+        for wd in words:
+            if len(cur) + len(wd) + 1 <= max_chars:
+                cur = (cur + " " + wd).strip()
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = wd
+        if cur:
+            lines.append(cur)
+        return lines or [""]
+
+    # -- input → unlock transition -----------------------------------------
+    def _on_input_event(self, event):
+        if self.state != "INITIAL":
+            return
+        self.state = "UNLOCK"
+        self._fade_museum_card()
+        self._start_neo_typewriter()
+        self._start_auth_state()
+
+    def _fade_museum_card(self):
+        # tkinter can't alpha-fade items; we just dim color
+        win = self.windows[0]
+        c = win["canvas"]
+        for cid in self.museum_card_ids:
+            try:
+                kind = c.type(cid)
+                if kind == "text":
+                    c.itemconfig(cid, fill=TEXT_TERTIARY)
+                elif kind == "line":
+                    c.itemconfig(cid, fill=DIVIDER)
+            except tk.TclError:
+                pass
+
+    # -- Neo subtle typewriter ----------------------------------------------
+    def _start_neo_typewriter(self):
+        win = self.windows[0]
+        c = win["canvas"]
+        h = win["h"]
+        size = max(10, h // 110)
+        self._neo_font = (FONT_MONO, size)
+        self._neo_x = 28
+        self._neo_y = 28
+        self._neo_line_h = int(size * 1.5)
+        self._neo_current_line_y = self._neo_y
+        self._neo_line_text = ""
+        self._neo_current_line_id = None
+        self._neo_line_ids = []
+        self._neo_canvas = c
+        self._neo_idx = 0
+        self._type_next_char()
+
+    def _type_next_char(self):
+        if self._neo_idx >= len(NEO_TEXT):
+            # fade Neo after 1s
+            self.root.after(1000, self._fade_neo)
+            return
+        ch = NEO_TEXT[self._neo_idx]
+        self._neo_idx += 1
+        if ch == "\n":
+            self._neo_line_text = ""
+            self._neo_current_line_id = None
+            self._neo_current_line_y += self._neo_line_h
+        else:
+            self._neo_line_text += ch
+            if self._neo_current_line_id is not None:
+                try:
+                    self._neo_canvas.delete(self._neo_current_line_id)
+                except tk.TclError:
+                    pass
+            cid = self._neo_canvas.create_text(
+                self._neo_x, self._neo_current_line_y,
+                text=self._neo_line_text,
+                fill=TEXT_TERTIARY, font=self._neo_font, anchor="nw",
+            )
+            self._neo_current_line_id = cid
+            # track the "committed" line once newline comes
+            if not self._neo_line_ids or self._neo_line_ids[-1] != cid:
+                if self._neo_line_ids and self._neo_line_ids[-1] != cid:
+                    # replacing in-progress line
+                    self._neo_line_ids[-1] = cid
+                else:
+                    self._neo_line_ids.append(cid)
+        delay = 22
+        if ch in ".,!?":
+            delay = 140
+        elif ch == "\n":
+            delay = 80
+        self.root.after(delay, self._type_next_char)
+
+    def _fade_neo(self):
+        try:
+            for cid in self._neo_line_ids:
+                try:
+                    self._neo_canvas.delete(cid)
+                except tk.TclError:
+                    pass
+            self._neo_line_ids = []
+        except Exception:
+            pass
+
+    # -- AUTH card (macOS-inspired acrylic login) --------------------------
+    def _start_auth_state(self):
+        self.state = "AUTH"
+        win = self.windows[0]
+        c = win["canvas"]
+        w, h = win["w"], win["h"]
+
+        card_w = max(360, min(int(w * 0.26), 520))
+        card_h = max(360, min(int(h * 0.42), 520))
+        cx = w // 2
+        cy = int(h * 0.57)
+        x0 = cx - card_w // 2
+        y0 = cy - card_h // 2
+        x1 = x0 + card_w
+        y1 = y0 + card_h
+
+        name_size = max(18, int(h * 0.024))
+        label_size = max(10, int(h * 0.012))
+        input_size = max(14, int(h * 0.018))
+        hint_size = max(10, int(h * 0.014))
+
+        bleed = max(18, int(h * 0.018))
+        bx0 = max(0, x0 - bleed)
+        by0 = max(0, y0 - bleed)
+        bx1 = min(w, x1 + bleed)
+        by1 = min(h, y1 + bleed)
+        backdrop_tk = None
+        try:
+            base = getattr(self, "_main_painting_original", None)
+            if base is not None:
+                acrylic = acrylic_crop(
+                    base,
+                    (bx0, by0, bx1, by1),
+                    blur_radius=max(24, int(h * 0.032)),
+                    darken_alpha=132,
+                )
+                backdrop_tk = pil_to_tk(acrylic)
+                c.create_image(bx0, by0, anchor="nw", image=backdrop_tk)
+        except Exception:
+            backdrop_tk = None
+        # Pin the PhotoImage to the canvas so GC doesn't collect it.
+        if backdrop_tk is not None:
+            if not hasattr(c, "_auth_image_refs"):
+                c._auth_image_refs = []
+            c._auth_image_refs.append(backdrop_tk)
+
+        display_name = get_display_name()
+
+        shadow = c.create_oval(cx - 62, y0 + 44, cx + 62, y0 + 168,
+                               fill="#000000", outline="")
+        c.itemconfig(shadow, stipple="gray50")
+        avatar = c.create_oval(cx - 58, y0 + 40, cx + 58, y0 + 156,
+                               fill="#d8dde7", outline="#ffffff", width=2)
+        initials = "".join(part[:1] for part in display_name.split()[:2]).upper() or "L"
+        c.create_text(cx, y0 + 98,
+                      text=initials,
+                      fill="#1d1d22",
+                      font=(FONT_SANS, max(28, int(h * 0.04)), "bold"),
+                      anchor="center")
+
+        name_y = y0 + 188
+        c.create_text(cx, name_y,
+                      text=display_name,
+                      fill="#f6f6f8",
+                      font=(FONT_SANS, name_size, "bold"),
+                      anchor="center")
+
+        field_w = min(card_w - 72, 360)
+        field_h = max(34, int(h * 0.036))
+        field_x = cx - field_w // 2
+        user_entry = None
+        pw_y = name_y + 48
+        pw_entry = tk.Entry(
+            win["win"], show="•",
+            bg="#f3f3f6", fg="#151519",
+            insertbackground=ACCENT,
+            relief="flat", borderwidth=0,
+            highlightthickness=2,
+            highlightbackground="#cfd0d5",
+            highlightcolor=ACCENT,
+            font=(FONT_SANS, input_size),
+            justify="center",
+        )
+        pw_entry.place(x=field_x, y=pw_y, width=field_w, height=field_h)
+        accent_line = c.create_line(field_x + 20, pw_y + field_h + 12,
+                                    field_x + field_w - 20, pw_y + field_h + 12,
+                                    fill="#8c8c92", width=1)
+
+        pw_entry.bind("<Return>", self._on_password_submit)
+        pw_entry.bind("<Escape>", lambda e: None)
+        pw_entry.focus_set()
+
+        status_y = pw_y + field_h + max(42, int(h * 0.04))
+        status_id = c.create_text(cx, status_y,
+                                  text="",
+                                  fill=DESTRUCTIVE,
+                                  font=(FONT_SANS, hint_size),
+                                  anchor="center")
+
+        hint_y = y1 - max(30, int(h * 0.034))
+        c.create_text(cx, hint_y,
+                      text="Press Return to unlock",
+                      fill="#b7b7bd",
+                      font=(FONT_SANS, label_size),
+                      anchor="center")
+
+        self.auth_entry = pw_entry
+        self.user_entry = user_entry
+        self.auth_card = (c, avatar, accent_line,
+                          user_entry, pw_entry, status_id,
+                          x0, y0, card_w, card_h)
+
+    def _flash_card(self):
+        if not self.auth_card:
+            return
+        c, avatar_id, accent_id, *_ = self.auth_card
+
+        def _color(cid, color, width=None):
+            try:
+                kind = c.type(cid)
+            except tk.TclError:
+                return
+            try:
+                if kind == "rectangle":
+                    c.itemconfig(cid, outline=color)
+                else:
+                    # lines (and anything else with a fill attribute)
+                    if width is None:
+                        c.itemconfig(cid, fill=color)
+                    else:
+                        c.itemconfig(cid, fill=color, width=width)
+            except tk.TclError:
+                pass
+
+        _color(avatar_id, DESTRUCTIVE, width=2)
+        _color(accent_id, DESTRUCTIVE, width=2)
+        self.root.after(
+            220,
+            lambda: (_color(avatar_id, "#d8dde7", width=2),
+                     _color(accent_id, "#8c8c92", width=1)),
+        )
+
+    def _on_password_submit(self, event):
+        pw = self.auth_entry.get()
+        user = self.user_entry.get().strip() if getattr(self, "user_entry", None) else ""
+        self.auth_entry.delete(0, tk.END)
+        if self.preview:
+            self._exit(0)
+            return
+        if not user:
+            user = os.environ.get("USER") or os.getlogin()
+        ok = self._verify_password(user, pw)
+        if ok:
+            self._exit(0)
+        else:
+            self.failed_attempts += 1
+            self._flash_card()
+            c, _, _, _, _, status_id, *_ = self.auth_card
+            attempts_txt = "" if self.failed_attempts <= 1 else f"  ({self.failed_attempts} attempts)"
+            c.itemconfig(status_id, text=f"Incorrect password{attempts_txt}")
+
+    @staticmethod
+    def _verify_password(user, pw):
+        if not pw or not user:
+            return False
+        session_user = os.environ.get("USER") or os.getlogin()
+        # Safety: only accept the session owner — prevents locking another user
+        # into the unlock dialog or side-channel snooping. User can still type
+        # their own name in the field but it must match.
+        if user != session_user:
+            return False
+        try:
+            import pamela
+            for service in ("common-auth", "login"):
+                try:
+                    # A user-space locker only needs password verification.
+                    # pamela's default pam_setcred() path trips pam_group in
+                    # /etc/pam.d/login without root privileges.
+                    pamela.authenticate(user, pw, service=service, resetcred=False)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            proc = subprocess.Popen(
+                ["su", "-c", "true", user],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            proc.communicate(input=(pw + "\n").encode(), timeout=5)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    # -- killswitch & exit --------------------------------------------------
+    def _start_killswitch_poll(self):
+        def poll():
+            if KILLSWITCH.exists():
+                try:
+                    KILLSWITCH.unlink()
+                except OSError:
+                    pass
+                self._exit(2)
+                return
+            self._killswitch_timer = self.root.after(1000, poll)
+        poll()
+
+    def _exit(self, code):
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
+        sys.exit(code)
+
+    def run(self):
+        self.root.mainloop()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--preview", action="store_true",
+                        help="windowed 1280x720, no grab, no PAM")
+    parser.add_argument("--check", action="store_true",
+                        help="validate display, monitor detection, and assets")
+    args = parser.parse_args()
+    if args.check:
+        ensure_display_ready()
+        today = get_today()
+        today["painting_path"] = resolve_painting_path(today.get("painting_path"))
+        monitors = detect_monitors()
+        print(f"OK display ready; monitors={len(monitors)}; painting={today['painting_path']}")
+        return
+
+    lock_fd = None
+    if not args.preview:
+        lock_fd = acquire_instance_lock()
+    try:
+        log(f"start preview={args.preview}")
+        app = Locker(preview=args.preview)
+        app.run()
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    main()
